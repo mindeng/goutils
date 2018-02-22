@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -311,7 +312,7 @@ func guessTimeFromFilename(p string) (time.Time, error) {
 
 // ExtractExifDateTime extract Exif date time from the reader r
 // `exiftool -htmlDump /path/to/file` is very usefull
-func ExtractExifDateTime(r io.Reader) (time.Time, error) {
+func ExtractExifDateTime(r io.ReadSeeker) (time.Time, error) {
 	head := make([]byte, 2)
 	n, err := r.Read(head)
 	if err != nil {
@@ -384,7 +385,7 @@ func handleJPG(r io.Reader) (time.Time, error) {
 	}
 }
 
-func parseTIFF(app1Reader io.Reader, headerOffset int64) (time.Time, error) {
+func parseTIFF(app1Reader io.ReadSeeker, headerOffset int64) (time.Time, error) {
 
 	tiff := make([]byte, 4)
 	_, err := io.ReadFull(app1Reader, tiff)
@@ -411,11 +412,16 @@ func parseTIFF(app1Reader io.Reader, headerOffset int64) (time.Time, error) {
 	}
 
 	var offset int32
+	timeDict := make(map[string]time.Time)
 
 	for {
 		err = binary.Read(app1Reader, endian, &offset)
 		if err != nil {
-			return zeroTime, errors.New("exif: no next IFD offset")
+			if t, ok := timeDict["ModifyDate"]; ok {
+				return t, nil
+			} else {
+				return zeroTime, errors.New("exif: no next IFD offset")
+			}
 		}
 		if offset == 0 {
 			return zeroTime, errors.New("no time found")
@@ -427,16 +433,39 @@ func parseTIFF(app1Reader io.Reader, headerOffset int64) (time.Time, error) {
 		s.Seek(headerOffset, io.SeekStart)
 		s.Seek(int64(offset), io.SeekCurrent)
 
-		return parseDirEntry(app1Reader, endian, headerOffset)
+		if created, err := parseDirEntry(app1Reader, endian, headerOffset, timeDict); err == nil {
+			return created, err
+		}
 	}
 
 }
 
-func parseDirEntry(app1Reader io.Reader, endian binary.ByteOrder, headerOffset int64) (time.Time, error) {
+func parseDirEntry(app1Reader io.ReadSeeker, endian binary.ByteOrder, headerOffset int64, timeDict map[string]time.Time) (time.Time, error) {
 	var dirEntryCount int16
 	binary.Read(app1Reader, endian, &dirEntryCount)
 	// fmt.Printf("dirEntryCount: %d\n", dirEntryCount)
-	s := app1Reader.(io.Seeker)
+
+	getTimeForTag := func(r io.ReadSeeker, valueOffset uint32, length uint32) (time.Time, error) {
+		currentPos, err := r.Seek(0, io.SeekCurrent)
+		if err != nil {
+			log.Fatal("error: exif: cannot seek")
+		}
+
+		defer func() {
+			// Seek to next tag
+			if _, err := r.Seek(currentPos+12, io.SeekStart); err != nil {
+				log.Fatal("error: exif: cannot seek")
+			}
+		}()
+
+		r.Seek(headerOffset, io.SeekStart)
+		r.Seek(int64(valueOffset), io.SeekCurrent)
+		timeData := make([]byte, length)
+		if _, err = io.ReadFull(app1Reader, timeData); err != nil {
+			return zeroTime, err
+		}
+		return parseTime(string(timeData))
+	}
 
 	for i := 0; i < int(dirEntryCount); i++ {
 		var tag, dtype uint16
@@ -447,20 +476,26 @@ func parseDirEntry(app1Reader io.Reader, endian binary.ByteOrder, headerOffset i
 		binary.Read(app1Reader, endian, &valueOffset)
 		// fmt.Printf("tag: %04x valueOffset: %04x\n", tag, valueOffset)
 		switch tag {
-		case 0x0132, 0x9003:
-			s.Seek(headerOffset, io.SeekStart)
-			s.Seek(int64(valueOffset), io.SeekCurrent)
-			timeData := make([]byte, length)
-			_, err := io.ReadFull(app1Reader, timeData)
-			if err != nil {
-				return zeroTime, err
+		case 0x0132:
+			if t, err := getTimeForTag(app1Reader, valueOffset, length); err == nil {
+				timeDict["ModifyDate"] = t
 			}
-			return parseTime(string(timeData))
+		case 0x9003:
+			if t, err := getTimeForTag(app1Reader, valueOffset, length); err == nil {
+				timeDict["DateTimeOriginal"] = t
+				return t, nil
+			}
+		case 0x9004:
+			if t, err := getTimeForTag(app1Reader, valueOffset, length); err == nil {
+				timeDict["CreateDate"] = t
+				return t, nil
+			}
 		case 0x8769:
+			// fmt.Println("EXIF offset")
 			// EXIF offset
-			s.Seek(headerOffset, io.SeekStart)
-			s.Seek(int64(valueOffset), io.SeekCurrent)
-			return parseDirEntry(app1Reader, endian, headerOffset)
+			app1Reader.Seek(headerOffset, io.SeekStart)
+			app1Reader.Seek(int64(valueOffset), io.SeekCurrent)
+			return parseDirEntry(app1Reader, endian, headerOffset, timeDict)
 		}
 	}
 
