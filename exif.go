@@ -417,11 +417,7 @@ func parseTIFF(app1Reader io.ReadSeeker, headerOffset int64) (time.Time, error) 
 	for {
 		err = binary.Read(app1Reader, endian, &offset)
 		if err != nil {
-			if t, ok := timeDict["ModifyDate"]; ok {
-				return t, nil
-			} else {
-				return zeroTime, errors.New("exif: no next IFD offset")
-			}
+			return zeroTime, errors.New("exif: no next IFD offset")
 		}
 		if offset == 0 {
 			return zeroTime, errors.New("no time found")
@@ -435,6 +431,12 @@ func parseTIFF(app1Reader io.ReadSeeker, headerOffset int64) (time.Time, error) 
 
 		if created, err := parseDirEntry(app1Reader, endian, headerOffset, timeDict); err == nil {
 			return created, err
+		} else {
+			if t, ok := timeDict["ModifyDate"]; ok {
+				return t, nil
+			} else {
+				return created, err
+			}
 		}
 	}
 
